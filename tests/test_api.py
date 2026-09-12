@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
@@ -9,12 +10,13 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from arc_evaluation_api.app import create_app
+from arc_evaluation_api.app import RequestSizeLimitMiddleware, create_app
 from arc_evaluation_api.config import Settings
 
 EVALUATION_ID = "abc12345"
 TRAINING_ID = "def67890"
 SESSION = "test-session-0001"
+SYNTHETIC_OUTPUTS = [[[9, 8], [7, 6]]]
 
 
 def generated_hidden_grid(seed: int = 37) -> list[list[int]]:
@@ -115,7 +117,9 @@ def test_exact_three_attempts_and_persisted_audit_fields(
     assert [row[0] for row in rows] == [1, 2, 3]
     assert all(row[1] == "A non-empty explanation." for row in rows)
     assert all(row[2] == 0 and "T" in row[3] for row in rows)
-    assert [json.loads(row[4]) for row in rows] == [[[[1]]], [[[2]]], [[[3]]]]
+    assert [json.loads(row[4]) for row in rows] == [
+        wrong_output(value)["outputs"] for value in (1, 2, 3)
+    ]
 
 
 def test_success_is_terminal_and_does_not_consume_an_extra_attempt(
@@ -204,9 +208,9 @@ def test_concurrent_requests_atomically_cap_attempts(
         {"outputs": [[[0], [0, 1]]], "reasoning": "reason"},
         {"outputs": [[[10]]], "reasoning": "reason"},
         {"outputs": [[[True]]], "reasoning": "reason"},
-        {"outputs": [[[0]]], "reasoning": "   "},
+        {"outputs": SYNTHETIC_OUTPUTS, "reasoning": "   "},
         {"outputs": [[[0] * 31]], "reasoning": "reason"},
-        {"outputs": [[[0]]], "reasoning": "reason", "unexpected": "field"},
+        {"outputs": SYNTHETIC_OUTPUTS, "reasoning": "reason", "unexpected": "field"},
     ],
 )
 def test_malformed_submissions_are_rejected_without_consuming_attempts(
@@ -236,12 +240,12 @@ def test_output_count_and_oversized_request_are_rejected(
     oversized = client.post(
         f"/v1/evaluation/tasks/{EVALUATION_ID}/submissions",
         headers=headers(),
-        content=json.dumps({"outputs": [[[0]]], "reasoning": "x" * 70_000}),
+        content=json.dumps({"outputs": SYNTHETIC_OUTPUTS, "reasoning": "x" * 70_000}),
     )
     assert oversized.status_code == 413
 
     def chunks() -> Any:
-        yield json.dumps({"outputs": [[[0]]], "reasoning": "y" * 70_000}).encode()
+        yield json.dumps({"outputs": SYNTHETIC_OUTPUTS, "reasoning": "y" * 70_000}).encode()
 
     oversized_chunked = client.post(
         f"/v1/evaluation/tasks/{EVALUATION_ID}/submissions",
@@ -249,6 +253,84 @@ def test_output_count_and_oversized_request_are_rejected(
         content=chunks(),
     )
     assert oversized_chunked.status_code == 413
+
+    understated = client.post(
+        f"/v1/evaluation/tasks/{EVALUATION_ID}/submissions",
+        headers={**headers(), "Content-Length": "1"},
+        content=json.dumps({"outputs": SYNTHETIC_OUTPUTS, "reasoning": "z" * 70_000}),
+    )
+    assert understated.status_code == 413
+
+    invalid_length = client.post(
+        f"/v1/evaluation/tasks/{EVALUATION_ID}/submissions",
+        headers={**headers(), "Content-Length": "-1"},
+        content=b"{}",
+    )
+    assert invalid_length.status_code == 400
+
+
+def test_request_size_limit_stops_consuming_a_chunked_body_at_the_limit() -> None:
+    received_chunks = 0
+    sent_messages: list[dict[str, Any]] = []
+    chunks = [b"1234", b"5678", b"should-not-be-read"]
+
+    async def receive() -> dict[str, Any]:
+        nonlocal received_chunks
+        body = chunks[received_chunks]
+        received_chunks += 1
+        return {
+            "type": "http.request",
+            "body": body,
+            "more_body": received_chunks < len(chunks),
+        }
+
+    async def send(message: dict[str, Any]) -> None:
+        sent_messages.append(message)
+
+    async def consume_body(_: dict[str, Any], receive: Any, __: Any) -> None:
+        while (await receive()).get("more_body", False):
+            pass
+
+    scope = {"type": "http", "headers": []}
+    middleware = RequestSizeLimitMiddleware(consume_body, max_request_bytes=7)
+    asyncio.run(middleware(scope, receive, send))  # type: ignore[arg-type]
+
+    assert received_chunks == 2
+    assert sent_messages[0]["type"] == "http.response.start"
+    assert sent_messages[0]["status"] == 413
+
+
+@pytest.mark.parametrize(
+    "request_headers",
+    [
+        [(b"content-length", b"1"), (b"content-length", b"1")],
+        [(b"content-length", b"1"), (b"transfer-encoding", b"chunked")],
+        [(b"content-length", b"9" * 5_000)],
+    ],
+)
+def test_request_size_limit_rejects_ambiguous_framing(
+    request_headers: list[tuple[bytes, bytes]],
+) -> None:
+    downstream_called = False
+    sent_messages: list[dict[str, Any]] = []
+
+    async def downstream(_: Any, __: Any, ___: Any) -> None:
+        nonlocal downstream_called
+        downstream_called = True
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent_messages.append(message)
+
+    middleware = RequestSizeLimitMiddleware(downstream, max_request_bytes=7)
+    scope = {"type": "http", "headers": request_headers}
+    asyncio.run(middleware(scope, receive, send))  # type: ignore[arg-type]
+
+    assert downstream_called is False
+    assert sent_messages[0]["type"] == "http.response.start"
+    assert sent_messages[0]["status"] == 400
 
 
 @pytest.mark.parametrize(
@@ -289,6 +371,15 @@ def test_solution_is_absent_from_every_read_or_error_surface(
             f"/v1/evaluation/tasks/{EVALUATION_ID}/submissions",
             headers=headers(),
             json={"outputs": [hidden], "reasoning": "ok", "extra": hidden},
+        ),
+        client.post(
+            f"/v1/evaluation/tasks/{EVALUATION_ID}/submissions",
+            headers=headers(),
+            json={
+                "outputs": SYNTHETIC_OUTPUTS,
+                "reasoning": "ok",
+                json.dumps(hidden, separators=(",", ":")): "attacker-controlled field",
+            },
         ),
     ]
     for response in probes:
@@ -332,6 +423,12 @@ def test_optional_bearer_api_key(tmp_path: Path) -> None:
     )
     with TestClient(app) as client:
         assert client.get("/ready").status_code == 401
+        assert (
+            client.get(
+                "/ready", headers={b"Authorization": b"Bearer \xffxxxxxxxxxxxxxxxx"}
+            ).status_code
+            == 401
+        )
         assert (
             client.get(
                 "/ready", headers={"Authorization": "Bearer a-secure-internal-key"}
