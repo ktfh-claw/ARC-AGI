@@ -1,0 +1,22 @@
+[Unit]
+Description=ARC Evaluation API
+After=network.target
+
+[Service]
+Type=simple
+User=arc-api
+Group=arc-api
+WorkingDirectory=/opt/arc-evaluation-api
+EnvironmentFile=/etc/arc-evaluation-api.env
+ExecStart=/opt/arc-evaluation-api/.venv/bin/python -m arc_evaluation_api
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/arc-evaluation-api
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
