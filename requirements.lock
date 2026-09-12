@@ -1,9 +1,10 @@
 # Fully resolved runtime environment for Python 3.12 on Ubuntu/Linux.
 # Regenerate from a clean virtual environment after changing requirements.txt.
+annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
 click==8.5.0
-fastapi==0.116.1
+fastapi==0.141.1
 h11==0.16.0
 httptools==0.8.0
 idna==3.19
@@ -11,7 +12,7 @@ pydantic==2.11.7
 pydantic_core==2.33.2
 python-dotenv==1.2.3
 PyYAML==6.0.3
-starlette==0.47.3
+starlette==1.6.0
 typing-inspection==0.4.4
 typing_extensions==4.16.0
 uvicorn==0.35.0

@@ -12,7 +12,10 @@ service on a trusted network or behind an authenticating reverse proxy and set `
 random value of at least 16 characters. With that setting, protected routes also require
 `Authorization: Bearer <key>`. A shared key does not stop one authorized caller from impersonating
 another session; use proxy-issued identity or per-client credentials before exposing this service
-to mutually untrusted clients.
+to mutually untrusted clients. A caller allowed to choose fresh session IDs can reset its own
+attempt budget indefinitely. An enforcing proxy must strip the inbound `X-Session-ID` and inject a
+stable identity derived from authenticated client credentials. Also apply connection/rate limits
+and monitor the SQLite volume: request-size limits do not bound growth from newly minted sessions.
 
 No static file route is installed. Dataset roots and split names are fixed server-side, and task IDs
 must be exactly eight lowercase hexadecimal characters.
@@ -70,7 +73,9 @@ curl --fail -H 'Authorization: Bearer YOUR_KEY' http://127.0.0.1:8000/ready
 
 The default bind is `0.0.0.0:8000`. Apply an Ubuntu firewall rule and/or reverse proxy appropriate
 to the trusted internal network; do not publish this port directly to untrusted networks. SQLite
-state lives in `/var/lib/arc-evaluation-api` and should be included in host backups.
+state lives in `/var/lib/arc-evaluation-api` and should be included in host backups. Because the
+database uses WAL mode, use SQLite's online backup mechanism or stop the service before copying it;
+copying only the main database file while the service is active can omit recent submissions.
 
 `requirements.txt` pins the direct runtime dependencies and `requirements.lock` records the fully
 resolved Python 3.12 Ubuntu/Linux runtime. Regenerate the lock in a clean environment whenever a

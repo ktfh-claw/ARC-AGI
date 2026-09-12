@@ -12,8 +12,8 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response
-from starlette.middleware.base import RequestResponseEndpoint
+from fastapi.responses import JSONResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Settings
 from .database import AttemptResult, SubmissionDatabase, TerminalTaskError
@@ -21,6 +21,73 @@ from .dataset import DatasetIntegrityError, DatasetStore, UnknownTaskError
 from .models import SubmissionRequest
 
 SESSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$")
+
+
+class RequestTooLargeError(HTTPException):
+    """Raised while incrementally reading a request body beyond its configured limit."""
+
+    def __init__(self) -> None:
+        super().__init__(status_code=413, detail="request too large")
+
+
+class RequestSizeLimitMiddleware:
+    def __init__(self, app: ASGIApp, max_request_bytes: int):
+        if max_request_bytes < 1:
+            raise ValueError("max_request_bytes must be positive")
+        self.app = app
+        self.max_request_bytes = max_request_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        content_lengths = [
+            value for name, value in scope["headers"] if name.lower() == b"content-length"
+        ]
+        transfer_encodings = [
+            value for name, value in scope["headers"] if name.lower() == b"transfer-encoding"
+        ]
+        if (
+            len(content_lengths) > 1
+            or (content_lengths and (not content_lengths[0] or not content_lengths[0].isdigit()))
+            or (content_lengths and transfer_encodings)
+        ):
+            await JSONResponse(status_code=400, content={"detail": "invalid content length"})(
+                scope, receive, send
+            )
+            return
+        if content_lengths:
+            try:
+                declared_length = int(content_lengths[0])
+            except ValueError:
+                await JSONResponse(status_code=400, content={"detail": "invalid content length"})(
+                    scope, receive, send
+                )
+                return
+            if declared_length > self.max_request_bytes:
+                await JSONResponse(status_code=413, content={"detail": "request too large"})(
+                    scope, receive, send
+                )
+                return
+
+        received_bytes = 0
+
+        async def limited_receive() -> Message:
+            nonlocal received_bytes
+            message = await receive()
+            if message["type"] == "http.request":
+                received_bytes += len(message.get("body", b""))
+                if received_bytes > self.max_request_bytes:
+                    raise RequestTooLargeError
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except RequestTooLargeError:
+            await JSONResponse(status_code=413, content={"detail": "request too large"})(
+                scope, receive, send
+            )
 
 
 def _result_payload(result: AttemptResult) -> dict[str, Any]:
@@ -54,29 +121,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ),
         lifespan=lifespan,
     )
-
-    @app.middleware("http")
-    async def request_size_limit(request: Request, call_next: RequestResponseEndpoint) -> Response:
-        content_length = request.headers.get("content-length")
-        if content_length is not None:
-            try:
-                if int(content_length) > resolved_settings.max_request_bytes:
-                    return JSONResponse(status_code=413, content={"detail": "request too large"})
-            except ValueError:
-                return JSONResponse(status_code=400, content={"detail": "invalid content length"})
-        # Cover chunked requests that do not carry Content-Length as well.
-        if len(await request.body()) > resolved_settings.max_request_bytes:
-            return JSONResponse(status_code=413, content={"detail": "request too large"})
-        return await call_next(request)
+    app.add_middleware(
+        RequestSizeLimitMiddleware, max_request_bytes=resolved_settings.max_request_bytes
+    )
 
     @app.exception_handler(RequestValidationError)
-    async def validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
-        # Never echo request values: a submitted value may equal a hidden evaluation solution.
-        errors = [
-            {"location": list(error["loc"]), "message": error["msg"], "type": error["type"]}
-            for error in exc.errors()
-        ]
-        return JSONResponse(status_code=422, content={"detail": errors})
+    async def validation_error(_: Request, __: RequestValidationError) -> JSONResponse:
+        # Locations and messages can contain caller-controlled field names or values.
+        return JSONResponse(status_code=422, content={"detail": "invalid request"})
 
     @app.exception_handler(DatasetIntegrityError)
     async def dataset_error(_: Request, __: DatasetIntegrityError) -> JSONResponse:
@@ -94,7 +146,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         supplied = ""
         if authorization is not None and authorization.startswith("Bearer "):
             supplied = authorization[7:]
-        if not hmac.compare_digest(supplied, expected):
+        # Byte comparison also makes non-ASCII header bytes a clean authentication failure.
+        if not hmac.compare_digest(supplied.encode(), expected.encode()):
             raise HTTPException(status_code=401, detail="invalid credentials")
 
     def identify_session(x_session_id: str = Header()) -> str:
