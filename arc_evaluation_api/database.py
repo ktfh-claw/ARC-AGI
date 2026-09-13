@@ -11,6 +11,7 @@ from pathlib import Path
 from .dataset import Grid
 
 MAX_ATTEMPTS = 3
+AUDITED_METHODS = frozenset({"DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"})
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,30 @@ class SubmissionDatabase:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS submissions_lookup "
                 "ON submissions(session_id, task_id, attempt_count)"
+            )
+            # Request auditing intentionally lives outside the submissions table.  In
+            # particular, rejected requests must never acquire columns that could be
+            # populated from an untrusted body, header, URL, or validation error.
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS accepted_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    method TEXT NOT NULL,
+                    route TEXT NOT NULL,
+                    status_code INTEGER NOT NULL CHECK (status_code BETWEEN 100 AND 399),
+                    requested_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rejected_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    method TEXT NOT NULL,
+                    status_code INTEGER NOT NULL CHECK (status_code BETWEEN 400 AND 599),
+                    requested_at TEXT NOT NULL
+                )
+                """
             )
 
     def ready(self) -> bool:
@@ -114,6 +139,31 @@ class SubmissionDatabase:
                 ),
             )
             return self._result(correct, attempt_count)
+
+    def audit_request(self, *, method: str, route: str | None, status_code: int) -> None:
+        """Persist allowlisted request metadata; no caller content crosses this boundary."""
+        requested_at = datetime.now(UTC).isoformat()
+        safe_method = method if method in AUDITED_METHODS else "OTHER"
+        with self._connect() as connection:
+            if status_code < 400:
+                # Successful routing gives us a server-defined template.  Fall back to a
+                # fixed label for unusual ASGI responses rather than persisting a raw URL.
+                safe_route = route if route is not None else "unmatched"
+                connection.execute(
+                    """
+                    INSERT INTO accepted_requests (method, route, status_code, requested_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (safe_method, safe_route, status_code, requested_at),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO rejected_requests (method, status_code, requested_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (safe_method, status_code, requested_at),
+                )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)

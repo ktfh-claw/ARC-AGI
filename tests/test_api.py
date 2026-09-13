@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from arc_evaluation_api.app import RequestSizeLimitMiddleware, create_app
 from arc_evaluation_api.config import Settings
+from arc_evaluation_api.dataset import DatasetStore
 
 EVALUATION_ID = "abc12345"
 TRAINING_ID = "def67890"
@@ -435,3 +436,165 @@ def test_optional_bearer_api_key(tmp_path: Path) -> None:
             ).status_code
             == 200
         )
+
+
+def test_requests_are_separated_into_leak_resistant_audit_tables(
+    service: tuple[TestClient, list[list[int]], Path],
+) -> None:
+    client, hidden, database = service
+    secret = "audit-secret-that-must-not-be-stored"
+
+    accepted = client.get(f"/v1/evaluation/tasks/{EVALUATION_ID}?secret={secret}")
+    accepted_submission = client.post(
+        f"/v1/evaluation/tasks/{EVALUATION_ID}/submissions",
+        headers=headers(),
+        json={"outputs": SYNTHETIC_OUTPUTS, "reasoning": secret},
+    )
+    validation = client.post(
+        f"/v1/evaluation/tasks/{EVALUATION_ID}/submissions",
+        headers={**headers(), "Authorization": f"Bearer {secret}"},
+        json={"outputs": [hidden], "reasoning": secret, "unexpected": secret},
+    )
+    not_found = client.get(f"/missing/{secret}")
+    method_not_allowed = client.delete(f"/v1/evaluation/tasks/{EVALUATION_ID}?secret={secret}")
+    oversized = client.post(
+        f"/v1/evaluation/tasks/{EVALUATION_ID}/submissions?secret={secret}",
+        headers=headers(),
+        content=json.dumps({"outputs": SYNTHETIC_OUTPUTS, "reasoning": secret * 5_000}),
+    )
+
+    assert accepted.status_code == 200
+    assert accepted_submission.status_code == 200
+    assert [validation.status_code, not_found.status_code, method_not_allowed.status_code] == [
+        422,
+        404,
+        405,
+    ]
+    assert oversized.status_code == 413
+    with sqlite3.connect(database) as connection:
+        accepted_rows = connection.execute(
+            "SELECT method, route, status_code FROM accepted_requests"
+        ).fetchall()
+        rejected_rows = connection.execute(
+            "SELECT method, status_code FROM rejected_requests ORDER BY id"
+        ).fetchall()
+        audit_schema = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name IN ('accepted_requests', 'rejected_requests')"
+        ).fetchall()
+
+    assert accepted_rows == [
+        ("GET", "/v1/evaluation/tasks/{task_id}", 200),
+        ("POST", "/v1/evaluation/tasks/{task_id}/submissions", 200),
+    ]
+    assert rejected_rows == [("POST", 422), ("GET", 404), ("DELETE", 405), ("POST", 413)]
+    serialized_audit = repr((accepted_rows, rejected_rows, audit_schema))
+    assert secret not in serialized_audit
+    assert json.dumps(hidden) not in serialized_audit
+    for forbidden_column in (
+        "body",
+        "reasoning",
+        "output",
+        "authorization",
+        "api_key",
+        "session_id",
+        "query",
+    ):
+        assert forbidden_column not in " ".join(row[0].lower() for row in audit_schema)
+
+
+def test_authentication_rejection_is_audited_without_credentials(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    (data / "training").mkdir(parents=True)
+    (data / "evaluation").mkdir()
+    database = tmp_path / "db.sqlite3"
+    configured_key = "configured-secret-key"
+    supplied_key = "supplied-secret-key"
+    app = create_app(Settings(dataset_root=data, database_path=database, api_key=configured_key))
+
+    with TestClient(app) as client:
+        response = client.get("/ready", headers={"Authorization": f"Bearer {supplied_key}"})
+    assert response.status_code == 401
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            "SELECT method, status_code FROM rejected_requests"
+        ).fetchall()
+        stored_values = " ".join(
+            str(value)
+            for row in connection.execute("SELECT * FROM rejected_requests").fetchall()
+            for value in row
+        )
+    assert rows == [("GET", 401)]
+    assert configured_key not in stored_values
+    assert supplied_key not in stored_values
+
+
+def test_internal_error_is_safely_audited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "data"
+    (data / "training").mkdir(parents=True)
+    (data / "evaluation").mkdir()
+    database = tmp_path / "db.sqlite3"
+    internal_secret = "private-internal-exception-detail"
+
+    def fail(_: DatasetStore, __: str) -> list[str]:
+        raise RuntimeError(internal_secret)
+
+    monkeypatch.setattr(DatasetStore, "task_ids", fail)
+    app = create_app(Settings(dataset_root=data, database_path=database, api_key=None))
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/v1/evaluation/tasks")
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "internal server error"}
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT method, status_code FROM rejected_requests"
+        ).fetchone()
+        stored_values = " ".join(
+            str(value) for value in connection.execute("SELECT * FROM rejected_requests").fetchone()
+        )
+    assert row == ("GET", 500)
+    assert internal_secret not in stored_values
+
+
+def test_audit_schema_is_added_to_an_existing_database(tmp_path: Path) -> None:
+    database = tmp_path / "existing.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE submissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL CHECK (attempt_count BETWEEN 1 AND 3),
+                proposed_output_json TEXT NOT NULL,
+                reasoning TEXT NOT NULL CHECK (length(trim(reasoning)) > 0),
+                correct INTEGER NOT NULL CHECK (correct IN (0, 1)),
+                submitted_at TEXT NOT NULL,
+                UNIQUE (session_id, task_id, attempt_count)
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO submissions "
+            "(session_id, task_id, attempt_count, proposed_output_json, reasoning, correct, "
+            "submitted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (SESSION, EVALUATION_ID, 1, "[[[0]]]", "existing", 0, "2026-01-01T00:00:00+00:00"),
+        )
+
+    data = tmp_path / "data"
+    (data / "training").mkdir(parents=True)
+    (data / "evaluation").mkdir()
+    with TestClient(
+        create_app(Settings(dataset_root=data, database_path=database, api_key=None))
+    ) as client:
+        assert client.get("/health").status_code == 200
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM submissions").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM accepted_requests").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM rejected_requests"
+        ).fetchone()[0] == 0

@@ -23,6 +23,14 @@ The application does not log request bodies, reasoning, guesses, or expected out
 normal access log contains request paths and response status only; do not add request-body logging
 at a reverse proxy or run production workers with debugger-style traceback-local-variable capture.
 
+Every HTTP request is audited in SQLite. Accepted responses are stored in `accepted_requests` with
+only the HTTP method, server-defined route template, status code, and timestamp. Rejected responses
+are kept separately in `rejected_requests` with only method, status code, and timestamp; their raw
+path is intentionally omitted because even a URL can contain attacker-controlled secrets. Neither
+table stores headers, query strings, client/session identifiers, bodies, validation details,
+responses, guesses, reasoning, credentials, or dataset content. Existing databases are migrated
+in place at startup with additive `CREATE TABLE IF NOT EXISTS` statements.
+
 ## Endpoints
 
 - `GET /health`: process liveness (intentionally unauthenticated).

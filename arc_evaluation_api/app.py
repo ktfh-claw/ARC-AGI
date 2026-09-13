@@ -90,6 +90,37 @@ class RequestSizeLimitMiddleware:
             )
 
 
+class RequestAuditMiddleware:
+    """Record one safe audit row for every completed HTTP request."""
+
+    def __init__(self, app: ASGIApp, database: SubmissionDatabase):
+        self.app = app
+        self.database = database
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        status_code = 500
+
+        async def capture_status(message: Message) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, capture_status)
+        finally:
+            route_object = scope.get("route")
+            route = getattr(route_object, "path", None)
+            method = str(scope.get("method", "UNKNOWN")).upper()
+            # Persistence accepts only the method, server-defined route template (for
+            # accepted requests), status, and timestamp.  Never pass the request object.
+            self.database.audit_request(method=method, route=route, status_code=status_code)
+
+
 def _result_payload(result: AttemptResult) -> dict[str, Any]:
     return {
         "correct": result.correct,
@@ -124,6 +155,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(
         RequestSizeLimitMiddleware, max_request_bytes=resolved_settings.max_request_bytes
     )
+    # Added last so it wraps request-size checks as well as FastAPI routing/validation.
+    app.add_middleware(RequestAuditMiddleware, database=database)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_: Request, __: RequestValidationError) -> JSONResponse:
