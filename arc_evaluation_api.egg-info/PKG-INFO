@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: arc-evaluation-api
+Version: 0.1.0
+Summary: Leak-resistant internal REST API for ARC-AGI evaluation
+Requires-Python: >=3.11
+License-File: LICENSE
+Requires-Dist: fastapi==0.141.1
+Requires-Dist: pydantic==2.11.7
+Requires-Dist: uvicorn[standard]==0.35.0
+Provides-Extra: dev
+Requires-Dist: httpx==0.28.1; extra == "dev"
+Requires-Dist: mypy==1.17.0; extra == "dev"
+Requires-Dist: pytest==9.0.3; extra == "dev"
+Requires-Dist: ruff==0.12.4; extra == "dev"
+Dynamic: license-file

@@ -11,17 +11,18 @@ RUN apt-get update \
 
 WORKDIR /opt/arc-evaluation-api
 
+RUN groupadd --system arc-api \
+ && useradd --system --gid arc-api --home-dir /opt/arc-evaluation-api \
+      --no-create-home --shell /usr/sbin/nologin arc-api \
+ && install -d -o arc-api -g arc-api -m 0750 /var/lib/arc-evaluation-api
+
 COPY requirements.lock .
 RUN python3 -m venv .venv \
  && .venv/bin/pip install --no-cache-dir -r requirements.lock
 
 COPY arc_evaluation_api/ arc_evaluation_api/
 COPY deployment/ deployment/
-
-RUN install -d -o arc-api -g arc-api -m 0750 /var/lib/arc-evaluation-api \
- && install -d -o arc-api -g arc-api -m 0750 /opt/arc-evaluation-api/data
-
-RUN useradd --system --home /opt/arc-evaluation-api --shell /usr/sbin/nologin arc-api 2>/dev/null || true
+COPY --chown=root:arc-api data/ data/
 
 ENV ARC_DATASET_ROOT=/opt/arc-evaluation-api/data \
     ARC_DATABASE_PATH=/var/lib/arc-evaluation-api/submissions.sqlite3 \
